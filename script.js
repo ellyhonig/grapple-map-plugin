@@ -1,1212 +1,272 @@
-/*
- * Enhanced 3D grapple demo based on topology coordinates and a simple
- * finite state machine. This script renders two chains (avatars) in a 3D
- * space and allows the user to select between pre-defined states or
- * automatically loaded entries from the GrappleMap database. Joints can
- * be selected with the left mouse button and dragged to new positions.
- * Bone lengths remain fixed by propagating positional changes along each
- * chain. A rudimentary linking number is computed by projecting the
- * chains onto the XY plane and summing oriented crossings. The current
- * linking number is displayed in the overlay. A drop‑down menu allows
- * selecting between available states; when a state is selected the chains
- * are updated accordingly.
- */
+/* -----------------------------------------------------------
+ * 3-D GrappleMap demo – super-compact version with
+ *  • 14-joint avatar  (foot-knee-hip-shoulder-hand + head)
+ *  • minimal sphere-constraint IK
+ *  • camera orbit / zoom
+ *  • search-able pose list (from states.js)
+ * --------------------------------------------------------- */
 
-class Vec3 {
-  constructor(x = 0, y = 0, z = 0) {
-    this.x = x;
-    this.y = y;
-    this.z = z;
-  }
-  clone() {
-    return new Vec3(this.x, this.y, this.z);
-  }
-  copy(v) {
-    this.x = v.x;
-    this.y = v.y;
-    this.z = v.z;
-    return this;
-  }
-  add(v) {
-    this.x += v.x;
-    this.y += v.y;
-    this.z += v.z;
-    return this;
-  }
-  sub(v) {
-    this.x -= v.x;
-    this.y -= v.y;
-    this.z -= v.z;
-    return this;
-  }
-  multiplyScalar(s) {
-    this.x *= s;
-    this.y *= s;
-    this.z *= s;
-    return this;
-  }
-  length() {
-    return Math.hypot(this.x, this.y, this.z);
-  }
-  normalize() {
-    const len = this.length();
-    if (len > 0) {
-      this.multiplyScalar(1 / len);
+class V3 {
+  constructor(x=0,y=0,z=0){ this.x=x; this.y=y; this.z=z; }
+  clone(){ return new V3(this.x,this.y,this.z); }
+  add(v){ this.x+=v.x; this.y+=v.y; this.z+=v.z; return this; }
+  sub(v){ this.x-=v.x; this.y-=v.y; this.z-=v.z; return this; }
+  mul(s){ this.x*=s; this.y*=s; this.z*=s; return this; }
+  len(){ return Math.hypot(this.x,this.y,this.z); }
+  norm(){ const l=this.len(); return l?this.mul(1/l):this; }
+  dot(v){ return this.x*v.x+this.y*v.y+this.z*v.z; }
+  cross(v){return new V3(this.y*v.z-this.z*v.y,this.z*v.x-this.x*v.z,this.x*v.y-this.y*v.x);}
+}
+const PARENT = [
+  1,   // 0: leftFoot  ← leftKnee
+  2,   // 1: leftKnee  ← leftHip
+ -1,   // 2: leftHip   ← (root)
+  2,   // 3: core      ← leftHip
+  3,   // 4: leftShoulder ← core
+  4,   // 5: leftElbow   ← leftShoulder
+  5,   // 6: leftHand    ← leftElbow
+  3,   // 7: head        ← core
+  9,   // 8: rightHand   ← rightElbow
+ 10,   // 9: rightElbow  ← rightShoulder
+  3,   //10: rightShoulder ← core
+  2,   //11: rightHip    ← leftHip (root)
+ 11,   //12: rightKnee   ← rightHip
+ 12    //13: rightFoot   ← rightKnee
+];
+const HEAD_IDX       = 7;
+const HIP_IDX        = 2;
+const SHOULDER_L_IDX = 4;
+const SHOULDER_R_IDX = 10;
+
+/* ---------- tiny skeleton/IK helpers ---------------------------------- */
+const COLOR  = ['#e74c3c','#3498db'];                                      // red / blue
+const BONES = [
+  [0,1],[1,2],[2,3],    // left leg & hip-core
+  [3,4],[4,5],[5,6],    // left arm
+  [3,7],                // neck
+  [3,10],[10,9],[9,8],  // right arm
+  [2,11],[11,12],[12,13]// right leg
+];
+
+function propagateDescendants(i, Δ, av){
+  av.j.forEach((p, idx)=>{
+    if (PARENT[idx] === i){
+      const old = p.clone();
+      p.add(Δ);
+      clampToParent(idx, av);
+      const realΔ = p.clone().sub(old);
+      propagateDescendants(idx, realΔ, av);
     }
-    return this;
+  });
+}
+function clampRadialDelta(i, Δ, av){
+  const maxW = av.shoulderWidth;
+  const partners = (i === HEAD_IDX)
+    ? [SHOULDER_L_IDX, SHOULDER_R_IDX]
+    : [HEAD_IDX];
+  let d = Δ.clone();
+  for (const j of partners){
+    const v = av.j[i].clone().sub(av.j[j]);
+    const L = v.len();
+    if (L < 1e-6) continue;
+    const u = v.mul(1/L);                   // unit from j→i
+    const rad = u.dot(d);                   // how much Δ pushes out
+    if (rad <= 0) continue;                 // inward or tangent ok
+    const allowed = maxW - L;
+    if (L + rad > maxW){
+      const remove = rad - allowed;
+      d = d.sub(u.mul(remove));             // strip excess radial
+    }
   }
-  dot(v) {
-    return this.x * v.x + this.y * v.y + this.z * v.z;
-  }
-  cross(v) {
-    return new Vec3(
-      this.y * v.z - this.z * v.y,
-      this.z * v.x - this.x * v.z,
-      this.x * v.y - this.y * v.x
-    );
-  }
+  return d;
+}
+function clampNeckShoulder(i, av){
+  const W = av.shoulderWidth,
+        h = av.j[HEAD_IDX],
+        sL = av.j[SHOULDER_L_IDX],
+        sR = av.j[SHOULDER_R_IDX];
+
+  const clampPoint = (a, bIdx)=>{            // pull a toward b if too far
+    const b = av.j[bIdx], dir = a.clone().sub(b), d = dir.len();
+    if (d > W){
+      const newPos = b.clone().add(dir.mul(W/d)),
+            Δ = newPos.clone().sub(a);
+      av.j[bIdx === HEAD_IDX ? HEAD_IDX : i] = newPos;
+      propagateDescendants(bIdx === HEAD_IDX ? HEAD_IDX : i, Δ, av);
+      clampToParent(bIdx === HEAD_IDX ? HEAD_IDX : i, av);
+    }
+  };
+
+  if (i === HEAD_IDX){ clampPoint(h, SHOULDER_L_IDX); clampPoint(h, SHOULDER_R_IDX); }
+  else if (i === SHOULDER_L_IDX || i === SHOULDER_R_IDX){ clampPoint(h, i); }
 }
 
-// Chain class: represents a kinematic chain composed of joints and fixed segment lengths
-class Chain {
-  constructor(joints) {
-    this.joints = joints; // array of Vec3
-    this.lengths = [];
-    for (let i = 0; i < joints.length - 1; i++) {
-      const diff = joints[i + 1].clone().sub(joints[i]);
-      this.lengths.push(diff.length());
-    }
-  }
-  // Adjust the chain after moving joint at index idx
-  adjust(idx) {
-    // forward propagation: adjust joints after idx
-    for (let i = idx; i < this.joints.length - 1; i++) {
-      const a = this.joints[i];
-      const b = this.joints[i + 1];
-      const dir = b.clone().sub(a);
-      const len = dir.length();
-      const targetLen = this.lengths[i];
-      if (len === 0) continue;
-      dir.multiplyScalar(targetLen / len);
-      b.copy(a.clone().add(dir));
-    }
-    // backward propagation: adjust joints before idx
-    for (let i = idx; i > 0; i--) {
-      const a = this.joints[i];
-      const b = this.joints[i - 1];
-      const dir = b.clone().sub(a);
-      const len = dir.length();
-      const targetLen = this.lengths[i - 1];
-      if (len === 0) continue;
-      dir.multiplyScalar(targetLen / len);
-      b.copy(a.clone().add(dir));
-    }
-  }
+function makeAvatar(skel){
+  const j  = skel.map(p => new V3(p.x,p.y,p.z));
+  const len= j.map((_,i)=>PARENT[i]<0 ? 0 : j[i].clone().sub(j[PARENT[i]]).len());
+  const shoulderWidth = j[SHOULDER_L_IDX].clone().sub(j[SHOULDER_R_IDX]).len();
+  return { j, len, shoulderWidth };
 }
 
-(() => {
-  const canvas = document.getElementById('canvas');
-  const ctx = canvas.getContext('2d');
-  let width, height;
+function clampToParent(i,av){
+  const p=PARENT[i]; if(p<0) return;
+  const dir = av.j[i].clone().sub(av.j[p]);
+  const L   = av.len[i]||0;
+  if(!L) return;
+  av.j[i] = dir.len()<1e-6 ? av.j[p].clone().add(new V3(L,0,0))
+                           : av.j[p].clone().add(dir.norm().mul(L));
+}
 
-  function resize() {
-    width = canvas.width = window.innerWidth;
-    height = canvas.height = window.innerHeight;
-  }
-  window.addEventListener('resize', resize);
-  resize();
-
-  // Camera parameters
-  let camRadius = 10;
-  let camTheta = Math.PI / 4; // yaw angle
-  let camPhi = Math.PI / 6;   // pitch angle
-
-  // Chains (avatars)
-  const chain1 = new Chain([
-    new Vec3(-1, 0, -1),
-    new Vec3(-1, 1, -1),
-    new Vec3(-1, 2, -1),
-    new Vec3(-1, 3, -1),
-    new Vec3(-1, 3.5, -1),
-    new Vec3(-1, 4, -1)
-  ]);
-  const chain2 = new Chain([
-    new Vec3(1, 0, 1),
-    new Vec3(1, 1, 1),
-    new Vec3(1, 2, 1),
-    new Vec3(1, 3, 1),
-    new Vec3(1, 3.5, 1),
-    new Vec3(1, 4, 1)
-  ]);
-  const chains = [chain1, chain2];
-
-  // --- Finite state machine support ---
-  // Array of available states. Each state contains a name, positions for both chains,
-  // and a precomputed feature vector used for nearest-neighbour queries in the
-  // latent (topology) space. A state's feature vector is of the form
-  // [linkingNumber, centreDistance] where centreDistance measures the
-  // separation between the chains' centroids.
-  const states = [];
-  // Index of the last applied state. This is used to avoid repeatedly
-  // re‑applying the same state when the user drags a joint.
-  let currentStateIndex = -1;
-
-  // The skeletons for the two avatars in the current state. These arrays
-  // contain 10 points each representing major body parts (feet, knees,
-  // hips, shoulders, hands and head) for left and right sides. They are
-  // initialised with the fallback "Initial" pose and updated whenever
-  // applyState() is invoked.
-  let currentSkeleton1 = [];
-  let currentSkeleton2 = [];
-  // Store previous joint positions at the start of a drag so that we can
-  // revert if the new configuration self‑intersects or collides.
-  let prevPositions = null;
-
-  /**
-   * Return a small set of fallback states if loading the GrappleMap database fails.
-   * Each state defines the joint positions for both chains. These positions
-   * illustrate different topological configurations such as no crossing,
-   * crossing and twisting.
-   */
-  function getFallbackStates() {
-    // Helper to create a mirrored skeleton from a simplified six‑joint chain.
-    // The chain layout is [foot, knee, hip, shoulder, hand, head]. We
-    // reconstruct a 10‑joint skeleton by mirroring left‑side joints across
-    // the hips to obtain right‑side joints. This yields an approximate
-    // humanoid figure for fallback poses when the full GrappleMap data is
-    // unavailable.
-    function skeletonFromChain(chain) {
-      const [footL, kneeL, hip, shoulder, hand, head] = chain;
-      // Mirror a point across the hip in the x‑direction
-      const mirror = (p) => {
-        const dx = p.x - hip.x;
-        return { x: hip.x - dx, y: p.y, z: p.z };
-      };
-      const footR = mirror(footL);
-      const kneeR = mirror(kneeL);
-      const shoulderR = mirror(shoulder);
-      const handR = mirror(hand);
-      return [
-        footL,
-        kneeL,
-        hip,
-        shoulder,
-        hand,
-        head,
-        handR,
-        shoulderR,
-        kneeR,
-        footR
-      ];
-    }
-    // Define fallback poses with skeletons derived from their chains
-    const base = [
-      {
-        name: 'Initial',
-        chain1: [
-          { x: -1, y: 0, z: -1 },
-          { x: -1, y: 1, z: -1 },
-          { x: -1, y: 2, z: -1 },
-          { x: -1, y: 3, z: -1 },
-          { x: -1, y: 3.5, z: -1 },
-          { x: -1, y: 4, z: -1 }
-        ],
-        chain2: [
-          { x: 1, y: 0, z: 1 },
-          { x: 1, y: 1, z: 1 },
-          { x: 1, y: 2, z: 1 },
-          { x: 1, y: 3, z: 1 },
-          { x: 1, y: 3.5, z: 1 },
-          { x: 1, y: 4, z: 1 }
-        ]
-      },
-      {
-        name: 'Cross',
-        chain1: [
-          { x: -2, y: 0, z: -1 },
-          { x: -1, y: 1, z: -1 },
-          { x: 0, y: 2, z: -1 },
-          { x: 1, y: 3, z: -1 },
-          { x: 1.5, y: 3.5, z: -1 },
-          { x: 2, y: 4, z: -1 }
-        ],
-        chain2: [
-          { x: 2, y: 0, z: 1 },
-          { x: 1, y: 1, z: 1 },
-          { x: 0, y: 2, z: 1 },
-          { x: -1, y: 3, z: 1 },
-          { x: -1.5, y: 3.5, z: 1 },
-          { x: -2, y: 4, z: 1 }
-        ]
-      },
-      {
-        name: 'Twist',
-        chain1: [
-          { x: -1, y: 0, z: 0 },
-          { x: -0.5, y: 1, z: 0.5 },
-          { x: 0, y: 2, z: 1 },
-          { x: 0.5, y: 3, z: 0.5 },
-          { x: 0.75, y: 3.5, z: 0.25 },
-          { x: 1, y: 4, z: 0 }
-        ],
-        chain2: [
-          { x: 1, y: 0, z: 0 },
-          { x: 0.5, y: 1, z: -0.5 },
-          { x: 0, y: 2, z: -1 },
-          { x: -0.5, y: 3, z: -0.5 },
-          { x: -0.75, y: 3.5, z: -0.25 },
-          { x: -1, y: 4, z: 0 }
-        ]
-      }
-    ];
-    return base.map((b) => {
-      return {
-        name: b.name,
-        chain1: b.chain1,
-        chain2: b.chain2,
-        skeleton1: skeletonFromChain(b.chain1),
-        skeleton2: skeletonFromChain(b.chain2)
-      };
-    });
+function moveJoint(i, Δ, av){
+  // prevent radial stretch on head/shoulder
+  if ([HEAD_IDX, SHOULDER_L_IDX, SHOULDER_R_IDX].includes(i)){
+    Δ = clampRadialDelta(i, Δ, av);
   }
 
-  /**
-   * Decode a position string from the GrappleMap database. The encoded
-   * representation uses base62 digits (a‑zA‑Z0‑9) to store joint
-   * coordinates at millimeter precision. Each coordinate is encoded by
-   * two base62 digits and scaled to meters. The decoding logic is based on
-   * the official C++ implementation (see persistence.cpp in GrappleMap).
-   *
-   * @param {string} s Encoded position string (concatenation of four lines)
-   * @returns {Array<{x:number,y:number,z:number}>} Array of joint positions
-   *          for both players (player 0 joints followed by player 1 joints).
-   */
-  function decodePositionString(s) {
-    const base62 = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-    const map = {};
-    for (let i = 0; i < base62.length; i++) map[base62[i]] = i;
-    let offset = 0;
-    const nextdigit = () => {
-      // skip whitespace
-      while (offset < s.length && /\s/.test(s[offset])) offset++;
-      return map[s[offset++]];
-    };
-    const g = () => {
-      const d0 = nextdigit() * 62;
-      const d1 = nextdigit();
-      return (d0 + d1) / 1000;
-    };
-    const positions = [];
-    const jointCount = 23;
-    const totalJoints = jointCount * 2;
-    for (let i = 0; i < totalJoints; i++) {
-      const x = g() - 2;
-      const y = g();
-      const z = g() - 2;
-      positions.push({ x, y, z });
-    }
-    return positions;
+  if (PARENT[i] < 0){
+    av.j.forEach((p, idx)=>{ if (idx !== i) p.add(Δ); });
+    av.j[i].add(Δ);
+    return;
   }
 
-  /**
-   * Derive a simplified chain of six joints (foot, knee, hip, shoulder,
-   * hand, head) from a full set of 23 joint positions for one player. The
-   * positions are averaged across corresponding left/right joints. The indices
-   * of the underlying joints are based on the order defined in GrappleMap's
-   * playerJoints array (see positions.hpp).
-   *
-   * @param {Array<{x:number,y:number,z:number}>} joints Array of 23 joint
-   *    positions for one player.
-   * @returns {Array<{x:number,y:number,z:number}>} Simplified chain with
-   *    six joint positions.
-   */
-  function deriveChain(joints) {
-    // Helper to average a list of points
-    const avg = (indices) => {
-      const out = { x: 0, y: 0, z: 0 };
-      indices.forEach((idx) => {
-        out.x += joints[idx].x;
-        out.y += joints[idx].y;
-        out.z += joints[idx].z;
-      });
-      const inv = 1 / indices.length;
-      out.x *= inv;
-      out.y *= inv;
-      out.z *= inv;
-      return out;
-    };
-    // Indices mapping for joints in GrappleMap
-    const LeftToe = 0, RightToe = 1;
-    const LeftHeel = 2, RightHeel = 3;
-    const LeftAnkle = 4, RightAnkle = 5;
-    const LeftKnee = 6, RightKnee = 7;
-    const LeftHip = 8, RightHip = 9;
-    const LeftShoulder = 10, RightShoulder = 11;
-    const LeftElbow = 12, RightElbow = 13;
-    const LeftWrist = 14, RightWrist = 15;
-    const LeftHand = 16, RightHand = 17;
-    //const LeftFingers = 18, RightFingers = 19;
-    const Core = 20;
-    const Neck = 21;
-    const Head = 22;
-    // Build simplified joints
-    const foot = avg([LeftToe, RightToe, LeftHeel, RightHeel, LeftAnkle, RightAnkle]);
-    const knee = avg([LeftKnee, RightKnee]);
-    const hip = avg([LeftHip, RightHip, Core]);
-    const shoulder = avg([LeftShoulder, RightShoulder]);
-    const hand = avg([LeftHand, RightHand, LeftWrist, RightWrist]);
-    const head = joints[Head];
-    return [foot, knee, hip, shoulder, hand, head];
-  }
+  const oldPos = av.j[i].clone();
+  av.j[i].add(Δ);
+  clampToParent(i, av);
+  const realΔ = av.j[i].clone().sub(oldPos);
+  propagateDescendants(i, realΔ, av);
+}
 
-  /**
-   * Derive a richer humanoid skeleton from the full set of joints for one
-   * player. This function extracts approximate positions for key body parts
-   * (feet, knees, hips, shoulders, hands and head) on both left and right
-   * sides. The resulting array contains 10 points in the following order:
-   *   0: left foot
-   *   1: left knee
-   *   2: hips (centre)
-   *   3: left shoulder
-   *   4: left hand
-   *   5: head
-   *   6: right hand
-   *   7: right shoulder
-   *   8: right knee
-   *   9: right foot
-   * The indices used correspond to GrappleMap's joint definitions: toes,
-   * heels and ankles for feet, knees for knees, hips and core for the
-   * centre, shoulders, wrists and hands for the arms and head. Averaging
-   * across multiple joints yields smoother positions.
-   *
-   * @param {Array<{x:number,y:number,z:number}>} joints 23‑joint positions
-   * @returns {Array<{x:number,y:number,z:number}>} 10‑joint skeleton
-   */
-  function deriveSkeletonPoints(joints) {
-    // Helper to average multiple joints
-    const avg = (indices) => {
-      const out = { x: 0, y: 0, z: 0 };
-      indices.forEach((idx) => {
-        out.x += joints[idx].x;
-        out.y += joints[idx].y;
-        out.z += joints[idx].z;
-      });
-      const inv = 1 / indices.length;
-      out.x *= inv;
-      out.y *= inv;
-      out.z *= inv;
-      return out;
-    };
-    // Derive 14 key points: leftFoot, leftKnee, leftHip, core, leftShoulder,
-    // leftElbow, leftHand, head, rightHand, rightElbow, rightShoulder,
-    // rightHip, rightKnee, rightFoot. See players.hpp for joint ordering.
-    const leftFoot = avg([0, 2, 4]);
-    const leftKnee = joints[6];
-    const leftHip = joints[8];
-    const core = avg([8, 9, 20]);
-    const leftShoulder = joints[10];
-    const leftElbow = joints[12];
-    // left hand at the palm (LeftHand index 16)
-    const leftHand = joints[16];
-    const head = joints[22];
-    // right hand at the palm (RightHand index 17)
-    const rightHand = joints[17];
-    const rightElbow = joints[13];
-    const rightShoulder = joints[11];
-    const rightHip = joints[9];
-    const rightKnee = joints[7];
-    const rightFoot = avg([1, 3, 5]);
-    return [leftFoot, leftKnee, leftHip, core, leftShoulder, leftElbow,
-            leftHand, head, rightHand, rightElbow, rightShoulder,
-            rightHip, rightKnee, rightFoot];
-  }
+/* ---------- state & UI ------------------------------------------------ */
+const canvas=document.getElementById('canvas'), ctx=canvas.getContext('2d');
+let W=canvas.width=innerWidth, H=canvas.height=innerHeight;
+addEventListener('resize',()=>{W=canvas.width=innerWidth;H=canvas.height=innerHeight;});
 
-  /**
-   * Parse the raw GrappleMap database text into an array of state objects.
-   * Each state represents a single pose (sequence with exactly one encoded
-   * position) extracted from the database. If an entry contains multiple
-   * encoded positions (e.g. drills), each encoded block is treated as a
-   * separate state. Only the first description line is used as the state
-   * name; if missing a generic name is generated. The number of states is
-   * limited to avoid overwhelming the browser.
-   *
-   * @param {string} text The raw contents of GrappleMap.txt
-   * @param {number} [limit=100] Maximum number of states to extract
-   * @returns {Array<{name:string,chain1:Array,chain2:Array}>}
-   */
-  function parseGrappleMap(text, limit = Infinity) {
-    /*
-     * Parse the GrappleMap database by scanning line by line.  Each entry
-     * consists of one or more description lines (not starting with
-     * whitespace and not beginning with "tags:"), followed by a tags line,
-     * and then exactly four encoded lines starting with whitespace.  The
-     * encoded lines store 23 joint positions for each player in a base62
-     * format.  This parser reconstructs the entries without relying on
-     * blank lines, which are absent in the database.  It yields up to
-     * `limit` poses.
-     */
-    const result = [];
-    const lines = text.split(/\n/);
-    let nameLines = [];
-    let encLines = [];
-    const finalize = () => {
-      if (!encLines.length) return;
-      const name = nameLines.join('\n') || `Pose ${result.length + 1}`;
-      const encoded = encLines.map((l) => l.trim()).join('');
-      try {
-        const positions = decodePositionString(encoded);
-        if (positions.length >= 46) {
-          const p0 = positions.slice(0, 23);
-          const p1 = positions.slice(23, 46);
-          const chain1Pos = deriveChain(p0);
-          const chain2Pos = deriveChain(p1);
-          const skeleton1 = deriveSkeletonPoints(p0);
-          const skeleton2 = deriveSkeletonPoints(p1);
-          result.push({
-            name: name.trim(),
-            chain1: chain1Pos,
-            chain2: chain2Pos,
-            skeleton1,
-            skeleton2
-          });
-        }
-      } catch (err) {
-        console.warn('Failed to decode position for entry', name, err);
-      }
-      nameLines = [];
-      encLines = [];
-    };
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      if (/^\s/.test(line)) {
-        // Encoded line begins with whitespace
-        encLines.push(line);
-        continue;
-      }
-      const trimmed = line.trim();
-      if (trimmed.startsWith('tags:')) {
-        // Ignore tags line
-        continue;
-      }
-      // If we encounter a new description line and have accumulated encoded
-      // lines from the previous entry, finalize the previous entry first.
-      if (encLines.length) {
-        finalize();
-        if (result.length >= limit) break;
-      }
-      nameLines.push(trimmed);
-    }
-    // Finalize last entry
-    if (encLines.length && result.length < limit) {
-      finalize();
-    }
-    // In case the limit was reached within finalize()
-    return result.slice(0, limit);
-  }
+let radius=8, theta=Math.PI/4, phi=Math.PI/6;
+const basis=()=>{                       // camera basis
+  const sp=Math.sin(phi),   cp=Math.cos(phi),
+        st=Math.sin(theta), ct=Math.cos(theta);
+  const pos=new V3(radius*cp*st, radius*sp, radius*cp*ct);
+  const fwd=pos.clone().mul(-1).norm(),  up=new V3(0,1,0);
+  const right=fwd.cross(up).norm(),      up2=right.clone().cross(fwd).norm();
+  return {pos,fwd,right,up:up2};
+};
 
-  /**
-   * Compute the centroid of a chain of Vec3 points.
-   * @param {Vec3[]} pts Array of Vec3.
-   * @returns {Vec3}
-   */
-  function centroidVec(pts) {
-    const c = new Vec3();
-    pts.forEach((p) => {
-      c.x += p.x;
-      c.y += p.y;
-      c.z += p.z;
-    });
-    const inv = 1 / pts.length;
-    c.x *= inv;
-    c.y *= inv;
-    c.z *= inv;
-    return c;
-  }
+function project(p,b){
+  const r=p.clone().sub(b.pos);
+  const x=r.dot(b.right), y=r.dot(b.up), z=r.dot(b.fwd);
+  if(z<0.1) return null;
+  const s=H*0.8;
+  return {x:s*x/z+W/2,y:-s*y/z+H/2,z};
+}
 
-  /**
-   * Compute the approximate linking number between two sets of joints.
-   * This is identical to computeLinking() but accepts explicit joint arrays,
-   * enabling us to calculate features for arbitrary states.
-   * @param {Vec3[]} jointsA
-   * @param {Vec3[]} jointsB
-   * @returns {number}
-   */
-  function computeLinkingBetween(jointsA, jointsB) {
-    let crossings = 0;
-    // Build segments for chain A
-    const segA = [];
-    for (let i = 0; i < jointsA.length - 1; i++) {
-      segA.push({ p: jointsA[i], q: jointsA[i + 1] });
-    }
-    const segB = [];
-    for (let i = 0; i < jointsB.length - 1; i++) {
-      segB.push({ p: jointsB[i], q: jointsB[i + 1] });
-    }
-    function orient(a, b, c) {
-      return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    }
-    for (const sa of segA) {
-      for (const sb of segB) {
-        const o1 = orient(sa.p, sa.q, sb.p);
-        const o2 = orient(sa.p, sa.q, sb.q);
-        const o3 = orient(sb.p, sb.q, sa.p);
-        const o4 = orient(sb.p, sb.q, sa.q);
-        if (o1 * o2 < 0 && o3 * o4 < 0) {
-          const sign = o1 > 0 ? 1 : -1;
-          crossings += sign;
-        }
-      }
-    }
-    return crossings / 2;
+/* ---------- load poses (from states.js or optional json) -------------- */
+let STATES=[];
+(async()=>{
+  if(Array.isArray(window.PRECOMPUTED_STATES)) STATES=window.PRECOMPUTED_STATES;
+  else {
+    const res=await fetch('grapple_states.json');    // fallback local JSON
+    STATES=await res.json();
   }
+  STATES=STATES.slice(0,500);                        // safety cap
+  populateDropdown();
+  applyState(0);
+})();
 
-  /**
-   * Compute a simple feature vector describing the topological relationship
-   * between two chains. The current implementation returns two values:
-   *  - linking number on the XY projection (integer or half integer)
-   *  - Euclidean distance between the chains' centroids
-   *
-   * @param {Chain|{joints:Vec3[]}} cA First chain-like object
-   * @param {Chain|{joints:Vec3[]}} cB Second chain-like object
-   * @returns {number[]} Feature vector [link, centreDistance]
-   */
-  function computeFeaturesForChains(cA, cB) {
-    const jointsA = cA.joints;
-    const jointsB = cB.joints;
-    const link = computeLinkingBetween(jointsA, jointsB);
-    const centroidA = centroidVec(jointsA);
-    const centroidB = centroidVec(jointsB);
-    const diff = centroidA.clone().sub(centroidB);
-    const centreDist = diff.length();
-    return [link, centreDist];
-  }
-
-  /**
-   * Compute and store feature vectors for all loaded states. Should be
-   * invoked once after states are populated.
-   */
-  function computeStateFeatures() {
-    states.forEach((st) => {
-      const jA = st.chain1.map((p) => new Vec3(p.x, p.y, p.z));
-      const jB = st.chain2.map((p) => new Vec3(p.x, p.y, p.z));
-      st.features = computeFeaturesForChains({ joints: jA }, { joints: jB });
-    });
-  }
-
-  /**
-   * Find the index of the state whose feature vector is closest to the given
-   * features. Uses simple Euclidean distance in the feature space.
-   * @param {number[]} feat Feature vector [link, centreDist]
-   * @returns {{idx:number, dist:number}}
-   */
-  function findNearestState(feat) {
-    let bestDist = Infinity;
-    let bestIdx = -1;
-    states.forEach((st, idx) => {
-      if (!st.features) return;
-      const f = st.features;
-      const d0 = f[0] - feat[0];
-      const d1 = f[1] - feat[1];
-      const dist = Math.sqrt(d0 * d0 + d1 * d1);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestIdx = idx;
+function populateDropdown(){
+  const sel=document.getElementById('state-select'), q=document.getElementById('state-search');
+  const rebuild=()=>{
+    const f=(q.value||'').trim().toLowerCase();
+    sel.innerHTML='';
+    STATES.forEach((s,i)=>{
+      if(!f||s.name.toLowerCase().includes(f)){
+        const o=document.createElement('option');
+        o.value=i; o.textContent=s.name.replace(/\n/g,' / ');
+        sel.appendChild(o);
       }
     });
-    return { idx: bestIdx, dist: bestDist };
-  }
+  };
+  q.oninput=rebuild; rebuild();
+  sel.onchange=e=>applyState(+e.target.value);
+}
 
-  /**
-   * Simple collision detection between the two current chains. Returns true
-   * if any joint pair comes within a small threshold distance. The threshold
-   * is tuned heuristically and may need adjustment depending on the scale
-   * of the environment.
-   * @returns {boolean}
-   */
-  function checkCollision() {
-    const threshold = 0.25;
-    for (const p of chain1.joints) {
-      for (const q of chain2.joints) {
-        const dx = p.x - q.x;
-        const dy = p.y - q.y;
-        const dz = p.z - q.z;
-        const distSq = dx * dx + dy * dy + dz * dz;
-        if (distSq < threshold * threshold) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
+/* ---------- live avatars ---------------------------------------------- */
+const AV=[null,null];                        // red, blue
+let selected={idx:-1,av:-1},  dragging=false,x0=0,y0=0;
 
-  /**
-   * Attempt to load the GrappleMap database from GitHub. The database is
-   * a plain text file where each entry describes a grappling position and
-   * includes encoded animation data. For the purpose of this demo we
-   * only extract the entry names and reuse placeholder joint positions.
-   */
-  async function loadStates() {
-    try {
-      /*
-       * Use precomputed states if available.  The `states.js` file
-       * defines a global PRECOMPUTED_STATES variable containing an
-       * array of pose definitions.  Loading these precomputed values
-       * avoids CORS issues and expensive parsing on the client.
-       */
-      if (Array.isArray(window.PRECOMPUTED_STATES)) {
-        window.PRECOMPUTED_STATES.forEach((st) => {
-          states.push({
-            name: st.name,
-            chain1: st.chain1,
-            chain2: st.chain2,
-            skeleton1: st.skeleton1,
-            skeleton2: st.skeleton2,
-            features: st.features
-          });
-        });
-      } else {
-        throw new Error('PRECOMPUTED_STATES not found');
-      }
-    } catch (errPre) {
-      console.warn('Precomputed states unavailable, attempting to fetch raw database:', errPre);
-      try {
-        const url = 'https://raw.githubusercontent.com/Eelis/GrappleMap/master/GrappleMap.txt';
-        const res = await fetch(url);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const text = await res.text();
-        const parsed = parseGrappleMap(text, 300);
-        states.push(...parsed);
-      } catch (err) {
-        console.error('Failed to load GrappleMap database:', err);
-      }
-    }
-    // Precompute feature vectors for any states lacking them
-    computeStateFeatures();
-    // Populate the drop‑down options
-    updateStateOptions();
-    // Apply the first available state if present
-    const sel = document.getElementById('state-select');
-    if (states.length > 0 && sel && sel.options.length > 0) {
-      const firstIdx = parseInt(sel.options[0].value);
-      if (!Number.isNaN(firstIdx)) {
-        applyState(firstIdx);
-      }
-    }
-  }
+/* skeleton from state (14 points already in file) -> avatar ------------ */
+function applyState(idx){
+  const s=STATES[idx];
+  AV[0]=makeAvatar(s.skeleton1 || s.chain1 /*fallback*/);
+  AV[1]=makeAvatar(s.skeleton2 || s.chain2);
+  document.getElementById('nearest-state').textContent=s.name.replace(/\n/g,' / ');
+}
 
-  /**
-   * Populate the state selection drop‑down with the names of all loaded states.
-   */
-  // Update the options displayed in the state <select> based on a search
-  // filter. An empty filter shows all states. This function is invoked
-  // whenever the search input changes or after the states have been loaded.
-  function updateStateOptions(filter = '') {
-    const sel = document.getElementById('state-select');
-    if (!sel) return;
-    sel.innerHTML = '';
-    const norm = filter.toLowerCase();
-    states.forEach((st, idx) => {
-      if (!norm || st.name.toLowerCase().includes(norm)) {
-        const opt = document.createElement('option');
-        opt.value = idx;
-        // Replace embedded newlines in the name with slashes for readability
-        opt.textContent = st.name.replace(/\n/g, ' / ');
-        sel.appendChild(opt);
-      }
+/* ---------- picking & interaction ------------------------------------ */
+canvas.oncontextmenu=e=>e.preventDefault();
+canvas.onmousedown=e=>{
+  x0=e.clientX; y0=e.clientY;
+  if(e.button===2){ dragging='cam'; return; }
+  const b=basis();
+  let best={d:1e9,av:-1,idx:-1};
+  AV.forEach((av,a)=>{
+    av.j.forEach((p,i)=>{
+      const pr=project(p,b); if(!pr) return;
+      const d=Math.hypot(pr.x-e.clientX, pr.y-e.clientY);
+      if(d<best.d && d<12) best={d,av:a,idx:i};
     });
-  }
-
-  /**
-   * Apply the joint positions of a given state to the current chains. This
-   * function recreates the joint arrays and recomputes the segment lengths.
-   *
-   * @param {number} idx Index of the state in the states array.
-   */
-  function applyState(idx) {
-    const st = states[idx];
-    if (!st) return;
-    // Copy positions into chain1
-    chain1.joints = st.chain1.map((p) => new Vec3(p.x, p.y, p.z));
-    chain1.lengths = [];
-    for (let i = 0; i < chain1.joints.length - 1; i++) {
-      const diff = chain1.joints[i + 1].clone().sub(chain1.joints[i]);
-      chain1.lengths.push(diff.length());
-    }
-    // Copy positions into chain2
-    chain2.joints = st.chain2.map((p) => new Vec3(p.x, p.y, p.z));
-    chain2.lengths = [];
-    for (let i = 0; i < chain2.joints.length - 1; i++) {
-      const diff = chain2.joints[i + 1].clone().sub(chain2.joints[i]);
-      chain2.lengths.push(diff.length());
-    }
-    currentStateIndex = idx;
-    // Update dropdown selection and nearest state display if DOM elements exist
-    const sel = document.getElementById('state-select');
-    if (sel) {
-      sel.value = idx;
-    }
-    const stateEl = document.getElementById('nearest-state');
-    if (stateEl) {
-      stateEl.textContent = st.name.replace(/\n/g, ' / ');
-    }
-
-    // If the state includes precomputed skeletons (from GrappleMap), use
-    // them directly to render the avatars.  Otherwise fall back to
-    // deriving skeletons from the simplified chains.  States parsed
-    // from GrappleMap include skeleton1/skeleton2 arrays with 14
-    // positions.  Fallback states omit these fields, so update the
-    // skeletons from chains in that case.
-    if (st.skeleton1 && st.skeleton2) {
-      currentSkeleton1 = st.skeleton1.map((p) => new Vec3(p.x, p.y, p.z));
-      currentSkeleton2 = st.skeleton2.map((p) => new Vec3(p.x, p.y, p.z));
-    } else {
-      updateSkeletonsFromChains();
-    }
-  }
-
-  // Event handler for the state selection drop‑down. Wait until the DOM is
-  // available before attaching the listener. The script is loaded at the
-  // bottom of the document so this code will execute after the DOM is
-  // constructed.
-  document.addEventListener('DOMContentLoaded', () => {
-    const sel = document.getElementById('state-select');
-    if (sel) {
-      sel.addEventListener('change', (e) => {
-        const idx = parseInt(e.target.value);
-        if (!Number.isNaN(idx)) {
-          applyState(idx);
-        }
-      });
-    }
-    // Attach input listener to the search field to filter state options
-    const search = document.getElementById('state-search');
-    if (search) {
-      search.addEventListener('input', (e) => {
-        updateStateOptions(e.target.value);
-      });
-    }
   });
-
-  // Kick off asynchronous loading of the GrappleMap database or fallback
-  loadStates();
-
-  // --- Interaction state ---
-  let selected = null; // {chain: chain, index: number}
-  let rotating = false;
-  let lastX = 0;
-  let lastY = 0;
-
-  // Prevent context menu on right-click
-  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-
-  // Picking on mousedown
-  canvas.addEventListener('mousedown', (e) => {
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    lastX = x;
-    lastY = y;
-    if (e.button === 0) {
-      // Left button: attempt to select a joint
-      const nearest = pickJoint(x, y);
-      if (nearest) {
-        selected = nearest;
-        // Save previous positions for collision revert
-        prevPositions = [
-          chain1.joints.map((p) => p.clone()),
-          chain2.joints.map((p) => p.clone())
-        ];
-      }
-    } else if (e.button === 2) {
-      // Right button: rotate camera
-      rotating = true;
-    }
-  });
-
-  document.addEventListener('mouseup', () => {
-    selected = null;
-    rotating = false;
-    // If we were dragging and recorded positions, perform collision check and
-    // revert if necessary. Do not snap to a nearest pose. Update the
-    // skeletons from the resulting chains. This lets the user explore the
-    // configuration space continuously.
-    if (prevPositions) {
-      if (checkCollision()) {
-        chain1.joints = prevPositions[0].map((p) => p.clone());
-        chain1.lengths = [];
-        for (let i = 0; i < chain1.joints.length - 1; i++) {
-          const diff = chain1.joints[i + 1].clone().sub(chain1.joints[i]);
-          chain1.lengths.push(diff.length());
-        }
-        chain2.joints = prevPositions[1].map((p) => p.clone());
-        chain2.lengths = [];
-        for (let i = 0; i < chain2.joints.length - 1; i++) {
-          const diff = chain2.joints[i + 1].clone().sub(chain2.joints[i]);
-          chain2.lengths.push(diff.length());
-        }
-      }
-      // Recompute skeletons from the final chain positions
-      updateSkeletonsFromChains();
-      prevPositions = null;
-    }
-  });
-
-  document.addEventListener('mousemove', (e) => {
-    const rect = canvas.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const dx = x - lastX;
-    const dy = y - lastY;
-    lastX = x;
-    lastY = y;
-    if (selected) {
-      // Move selected joint in world space based on screen delta
-      moveSelectedJoint(dx, dy);
-    } else if (rotating) {
-      // Rotate camera around origin
-      camTheta -= dx * 0.005;
-      camPhi -= dy * 0.005;
-      // Clamp phi to avoid singularities
-      const eps = 0.001;
-      camPhi = Math.max(eps, Math.min(Math.PI - eps, camPhi));
-    }
-  });
-
-  canvas.addEventListener('wheel', (e) => {
-    const delta = e.deltaY;
-    camRadius *= Math.exp(delta * 0.001);
-    camRadius = Math.max(2, Math.min(50, camRadius));
-    e.preventDefault();
-  });
-
-  // --- Camera helpers ---
-  // Compute camera basis vectors
-  function computeCameraBasis() {
-    // Camera position in world
-    const sinPhi = Math.sin(camPhi);
-    const cosPhi = Math.cos(camPhi);
-    const sinTheta = Math.sin(camTheta);
-    const cosTheta = Math.cos(camTheta);
-    const camPos = new Vec3(
-      camRadius * cosPhi * sinTheta,
-      camRadius * sinPhi,
-      camRadius * cosPhi * cosTheta
-    );
-    // Forward: from camera towards origin
-    const forward = camPos.clone().multiplyScalar(-1).normalize();
-    // Approx global up vector
-    const globalUp = new Vec3(0, 1, 0);
-    let right = forward.cross(globalUp).normalize();
-    // If forward is parallel to up, choose another up vector
-    if (right.length() === 0) {
-      right = new Vec3(1, 0, 0);
-    }
-    const up = right.clone().cross(forward).normalize();
-    return { camPos, forward, right, up };
+  if(best.av>-1){ selected=best; dragging='joint'; }
+};
+addEventListener('mouseup',()=>{ dragging=false; selected.idx=-1; });
+addEventListener('mousemove',e=>{
+  if(!dragging) return;
+  const dx=e.clientX-x0, dy=e.clientY-y0; x0=e.clientX; y0=e.clientY;
+  if(dragging==='cam'){
+    theta-=dx*0.005; phi =Math.min(Math.PI-0.01, Math.max(0.01,phi-dy*0.005)); return;
   }
+  const b=basis(), av=AV[selected.av], i=selected.idx;
+  const depth=av.j[i].clone().sub(b.pos).dot(b.fwd), scale=depth/(H*0.8);
+  const delta=b.right.clone().mul(dx*scale).add(b.up.clone().mul(-dy*scale));
+  moveJoint(i,delta,av);
+});
+addEventListener('wheel',e=>{ radius=Math.max(3,Math.min(20,radius*Math.exp(e.deltaY*0.001))); });
 
-  // Project a 3D point to 2D canvas coordinates
-  function projectPoint(pt, basis) {
-    const { camPos, forward, right, up } = basis;
-    const relative = pt.clone().sub(camPos);
-    // Coordinates in camera space
-    const xCam = relative.dot(right);
-    const yCam = relative.dot(up);
-    const zCam = relative.dot(forward);
-    // If point is behind the camera, skip projection by returning null
-    if (zCam <= 0.1) return null;
-    const fovScale = height * 0.8; // focal length scaled by canvas
-    const x2d = (fovScale * xCam) / zCam + width / 2;
-    const y2d = (-fovScale * yCam) / zCam + height / 2;
-    return { x: x2d, y: y2d, z: zCam };
-  }
+/* ---------- rendering ------------------------------------------------- */
+function drawAvatar(av,col,b){
+  const proj = av.j.map(p=>project(p,b));
+  ctx.strokeStyle = ctx.fillStyle = col;
+  BONES.forEach(([a,b])=>{
+    const A=proj[a], B=proj[b]; if(!A||!B) return;
+    ctx.lineWidth = Math.max(1,8/((A.z+B.z)*0.5));
+    ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
+  });
+  proj.forEach(p=>{
+    if(!p) return;
+    const r = Math.max(2,10/p.z);
+    ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2); ctx.fill();
+  });
+}
 
-  // Pick the closest joint near the mouse position
-  function pickJoint(px, py) {
-    const basis = computeCameraBasis();
-    let minDist = 12; // pixel threshold
-    let hit = null;
-    chains.forEach((chain) => {
-      chain.joints.forEach((pt, idx) => {
-        const proj = projectPoint(pt, basis);
-        if (!proj) return;
-        const dx = proj.x - px;
-        const dy = proj.y - py;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < minDist) {
-          minDist = dist;
-          hit = { chain, index: idx };
-        }
-      });
+function linkNumber(){
+  // quick 2-D signed crossing count (XY)
+  const segs=a=>a.j.slice(0,-1).map((p,i)=>[p,a.j[i+1]]);
+  const o=(a,b,c)=> (b.x-a.x)*(c.y-a.y)-(b.y-a.y)*(c.x-a.x);
+  let c=0; segs(AV[0]).forEach(as=>{
+    segs(AV[1]).forEach(bs=>{
+      const [a1,a2]=as,[b1,b2]=bs;
+      if(o(a1,a2,b1)*o(a1,a2,b2)<0 && o(b1,b2,a1)*o(b1,b2,a2)<0)
+        c+=o(a1,a2,b1)>0?1:-1;
     });
-    return hit;
-  }
+  });
+  return c/2;
+}
 
-  // Move selected joint based on screen delta
-  function moveSelectedJoint(dx, dy) {
-    const basis = computeCameraBasis();
-    const { right, up } = basis;
-    // Determine movement scale relative to distance from camera
-    const selPt = selected.chain.joints[selected.index];
-    // Project selected point to camera space to get depth
-    const rel = selPt.clone().sub(basis.camPos);
-    const depth = rel.dot(basis.forward);
-    const scale = depth / (height * 0.8);
-    // Compute world delta: right and up directions scaled by screen movement
-    const worldDelta = right.clone().multiplyScalar(dx * scale).add(
-      up.clone().multiplyScalar(-dy * scale)
-    );
-    // Compute proposed new position for the selected joint
-    let newPos = selPt.clone().add(worldDelta);
-    const chain = selected.chain;
-    const idx = selected.index;
-    // Clamp the new position so the joint does not extend beyond its
-    // neighbouring segments.  This prevents pulling a limb so far that
-    // it drags the entire body.  We ensure the distance to each
-    // adjacent joint does not exceed the corresponding segment length.
-    if (idx > 0) {
-      const prev = chain.joints[idx - 1];
-      const lenPrev = chain.lengths[idx - 1];
-      const dirPrev = newPos.clone().sub(prev);
-      const distPrev = dirPrev.length();
-      if (distPrev > lenPrev && distPrev > 1e-6) {
-        dirPrev.multiplyScalar(lenPrev / distPrev);
-        newPos = prev.clone().add(dirPrev);
-      }
-    }
-    if (idx < chain.joints.length - 1) {
-      const next = chain.joints[idx + 1];
-      const lenNext = chain.lengths[idx];
-      const dirNext = newPos.clone().sub(next);
-      const distNext = dirNext.length();
-      if (distNext > lenNext && distNext > 1e-6) {
-        dirNext.multiplyScalar(lenNext / distNext);
-        newPos = next.clone().add(dirNext);
-      }
-    }
-    // Apply the clamped position to the selected joint
-    selPt.copy(newPos);
-    // For the first chain (user poses), adjust only the limb segment
-    // rather than the entire chain.  Anchor the hip at index 2 so
-    // moving a foot or hand does not pull the whole body.  For the
-    // second chain (controlled via topology coordinates), fall back
-    // to full adjustment.
-    if (chain === chain1) {
-      const rootIdx = 2;
-      if (idx < rootIdx) {
-        for (let i = idx; i < rootIdx; i++) {
-          const a = chain.joints[i];
-          const b = chain.joints[i + 1];
-          const targetLen = chain.lengths[i];
-          const dir = b.clone().sub(a);
-          const len = dir.length();
-          if (len > 0) {
-            dir.multiplyScalar(targetLen / len);
-            b.copy(a.clone().add(dir));
-          }
-        }
-      } else if (idx > rootIdx) {
-        for (let i = idx; i > rootIdx; i--) {
-          const a = chain.joints[i];
-          const b = chain.joints[i - 1];
-          const targetLen = chain.lengths[i - 1];
-          const dir = b.clone().sub(a);
-          const len = dir.length();
-          if (len > 0) {
-            dir.multiplyScalar(targetLen / len);
-            b.copy(a.clone().add(dir));
-          }
-        }
-      } else {
-        chain.adjust(idx);
-      }
-    } else {
-      chain.adjust(idx);
-    }
-    // Update base chain positions so that subsequent topology
-    // transformations originate from the new pose.  We update the
-    // corresponding base chain for whichever chain was modified via
-    // direct manipulation.
-    if (chain === chain1) {
-      baseChain1 = chain1.joints.map((p) => p.clone());
-    } else if (chain === chain2 && !draggingTopology) {
-      baseChain2 = chain2.joints.map((p) => p.clone());
-    }
-    // Refresh the skeletons to reflect the updated joint positions
-    updateSkeletonsFromChains();
-  }
-
-  /**
-   * Recompute the approximate skeletons for both avatars based on the current
-   * simplified chains. This function mirrors the left‑side joints across the
-   * hips to produce right‑side counterparts. It is invoked after the user
-   * drags a joint so that the drawn humanoids follow the updated poses.
-   */
-  function updateSkeletonsFromChains() {
-    // Helper to mirror a point across the hip of a given chain
-    function mirrorPoint(p, hip) {
-      const dx = p.x - hip.x;
-      return new Vec3(hip.x - dx, p.y, p.z);
-    }
-    // Compute skeleton for a single chain
-    function computeSkeletonFromChain(chain) {
-      // Each simplified chain has 6 joints: foot, knee, hip, shoulder, hand, head.
-      // We derive a 14‑point skeleton mirroring left‑side joints across the hips and
-      // approximating elbows midway between the shoulder and hand. The hip also
-      // serves as the core for fallback poses.
-      const footL = chain.joints[0].clone();
-      const kneeL = chain.joints[1].clone();
-      const hip = chain.joints[2].clone();
-      const core = hip.clone();
-      const shoulderL = chain.joints[3].clone();
-      // approximate elbow halfway between shoulder and hand
-      const elbowL = chain.joints[3].clone().multiplyScalar(0.5).add(chain.joints[4].clone().multiplyScalar(0.5));
-      const handL = chain.joints[4].clone();
-      const head = chain.joints[5].clone();
-      // mirror points across the hip for right side
-      const handR = mirrorPoint(handL, hip);
-      const elbowR = mirrorPoint(elbowL, hip);
-      const shoulderR = mirrorPoint(shoulderL, hip);
-      const hipR = mirrorPoint(hip, hip); // identical to hip for fallback
-      const kneeR = mirrorPoint(kneeL, hip);
-      const footR = mirrorPoint(footL, hip);
-      return [footL, kneeL, hip, core, shoulderL, elbowL, handL, head,
-              handR, elbowR, shoulderR, hipR, kneeR, footR];
-    }
-    currentSkeleton1 = computeSkeletonFromChain(chain1);
-    currentSkeleton2 = computeSkeletonFromChain(chain2);
-  }
-
-  // Compute approximate linking number (project onto XY plane)
-  function computeLinking() {
-    let crossings = 0;
-    const segs = (chain) => {
-      const arr = [];
-      for (let i = 0; i < chain.joints.length - 1; i++) {
-        const p = chain.joints[i];
-        const q = chain.joints[i + 1];
-        arr.push({ p, q });
-      }
-      return arr;
-    };
-    const s1 = segs(chain1);
-    const s2 = segs(chain2);
-    // 2D oriented intersection test on XY plane
-    function orient(a, b, c) {
-      return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-    }
-    for (const segA of s1) {
-      for (const segB of s2) {
-        const a1 = segA.p;
-        const a2 = segA.q;
-        const b1 = segB.p;
-        const b2 = segB.q;
-        const o1 = orient(a1, a2, b1);
-        const o2 = orient(a1, a2, b2);
-        const o3 = orient(b1, b2, a1);
-        const o4 = orient(b1, b2, a2);
-        if (o1 * o2 < 0 && o3 * o4 < 0) {
-          // count orientation of crossing
-          const sign = o1 > 0 ? 1 : -1;
-          crossings += sign;
-        }
-      }
-    }
-    // The linking number of open curves is half the sum of signed crossings
-    return crossings / 2;
-  }
-
-  // Render loop
-  function render() {
-    ctx.clearRect(0, 0, width, height);
-    // Compute camera basis once per frame
-    const basis = computeCameraBasis();
-    // Draw humanoid skeletons for both avatars. Each skeleton is defined by
-    // 10 points in currentSkeleton1/currentSkeleton2 and a set of edges
-    // connecting them. Line thickness and joint size scale with depth to
-    // convey perspective.
-    const drawSkeleton = (skeleton, color) => {
-      if (!skeleton || skeleton.length === 0) return;
-      // Define edges connecting the skeleton joints (14‑point layout)
-      // Indices: 0:footL,1:kneeL,2:hipL,3:core,4:shoulderL,5:elbowL,6:handL,
-      // 7:head,8:handR,9:elbowR,10:shoulderR,11:hipR,12:kneeR,13:footR
-      // Define edges connecting the 14‑point skeleton.  The layout is:
-      // 0: left foot
-      // 1: left knee
-      // 2: left hip
-      // 3: core/torso
-      // 4: left shoulder
-      // 5: left elbow
-      // 6: left hand
-      // 7: head/neck
-      // 8: right hand
-      // 9: right elbow
-      // 10: right shoulder
-      // 11: right hip
-      // 12: right knee
-      // 13: right foot
-      // We connect legs up to the core, arms out from the shoulders,
-      // and the head connects to both shoulders to suggest a neck.
-      const edges = [
-        [0, 1], // left foot to left knee
-        [1, 2], // left knee to left hip
-        [2, 3], // left hip to core
-        [13, 12], // right foot to right knee (reverse order)
-        [12, 11], // right knee to right hip
-        [11, 3], // right hip to core
-        [3, 4], // core to left shoulder
-        [4, 5], // left shoulder to left elbow
-        [5, 6], // left elbow to left hand
-        [3, 10], // core to right shoulder
-        [10, 9], // right shoulder to right elbow
-        [9, 8], // right elbow to right hand
-        [4, 7], // left shoulder to head/neck
-        [10, 7] // right shoulder to head/neck
-      ];
-      // Project all points once
-      const projections = skeleton.map((pt) => projectPoint(pt, basis));
-      // Draw bones
-      ctx.strokeStyle = color;
-      edges.forEach(([a, b]) => {
-        const p = projections[a];
-        const q = projections[b];
-        if (!p || !q) return;
-        // Use average depth to determine line width (closer = thicker)
-        const depth = (p.z + q.z) * 0.5;
-        const lineW = Math.max(1, 8 / depth);
-        ctx.lineWidth = lineW;
-        ctx.beginPath();
-        ctx.moveTo(p.x, p.y);
-        ctx.lineTo(q.x, q.y);
-        ctx.stroke();
-      });
-      // Draw joints as filled circles. Radius inversely proportional to depth.
-      ctx.fillStyle = color;
-      projections.forEach((proj) => {
-        if (!proj) return;
-        const r = Math.max(2, 10 / proj.z);
-        ctx.beginPath();
-        ctx.arc(proj.x, proj.y, r, 0, Math.PI * 2);
-        ctx.fill();
-      });
-    };
-    drawSkeleton(currentSkeleton1, '#e74c3c');
-    drawSkeleton(currentSkeleton2, '#3498db');
-    // Display linking number
-    const linkValueEl = document.getElementById('link-value');
-    if (linkValueEl) {
-      linkValueEl.textContent = computeLinking().toFixed(1);
-    }
-    // Update nearest state display based on current configuration
-    const stateEl = document.getElementById('nearest-state');
-    if (stateEl && states.length > 0) {
-      const feat = computeFeaturesForChains(chain1, chain2);
-      const { idx: nearestIdx } = findNearestState(feat);
-      if (nearestIdx !== -1) {
-        stateEl.textContent = states[nearestIdx].name;
-      }
-    }
-    requestAnimationFrame(render);
-  }
-  render();
+(function loop(){
+  ctx.clearRect(0,0,W,H);
+  if(!AV[0]) return requestAnimationFrame(loop);
+  const b=basis();
+  drawAvatar(AV[0],COLOR[0],b);
+  drawAvatar(AV[1],COLOR[1],b);
+  document.getElementById('link-value').textContent=linkNumber().toFixed(1);
+  requestAnimationFrame(loop);
 })();
