@@ -360,62 +360,65 @@ class Chain {
   }
 
   /**
-  /**
-   * Derive an extended humanoid skeleton from the full set of joints for one
-   * player.  This function returns 18 points representing key body parts on
-   * both sides along with a central core and head.  The returned array
-   * contains the following points (in order):
-   *   0: left toe (LeftToe)
-   *   1: left ankle (LeftAnkle)
-   *   2: left knee (LeftKnee)
-   *   3: left hip (LeftHip)
-   *   4: core (Core)
-   *   5: left shoulder (LeftShoulder)
-   *   6: left elbow (LeftElbow)
-   *   7: left wrist (LeftWrist)
-   *   8: left hand (LeftHand)
-   *   9: head (Head)
-   *   10: right hand (RightHand)
-   *   11: right wrist (RightWrist)
-   *   12: right elbow (RightElbow)
-   *   13: right shoulder (RightShoulder)
-   *   14: right hip (RightHip)
-   *   15: right knee (RightKnee)
-   *   16: right ankle (RightAnkle)
-   *   17: right toe (RightToe)
-   * This richer skeleton exposes ankles and wrists so that the avatars
-   * resemble human figures more closely.  When available, we take the
-   * corresponding GrappleMap joint directly.  Otherwise, fallback
-   * approximations will interpolate between the neighbouring joints.
+   * Derive a richer humanoid skeleton from the full set of joints for one
+   * player. This function extracts approximate positions for key body parts
+   * (feet, knees, hips, shoulders, hands and head) on both left and right
+   * sides. The resulting array contains 10 points in the following order:
+   *   0: left foot
+   *   1: left knee
+   *   2: hips (centre)
+   *   3: left shoulder
+   *   4: left hand
+   *   5: head
+   *   6: right hand
+   *   7: right shoulder
+   *   8: right knee
+   *   9: right foot
+   * The indices used correspond to GrappleMap's joint definitions: toes,
+   * heels and ankles for feet, knees for knees, hips and core for the
+   * centre, shoulders, wrists and hands for the arms and head. Averaging
+   * across multiple joints yields smoother positions.
    *
    * @param {Array<{x:number,y:number,z:number}>} joints 23‑joint positions
-   * @returns {Array<{x:number,y:number,z:number}>} 18‑joint skeleton
+   * @returns {Array<{x:number,y:number,z:number}>} 10‑joint skeleton
    */
   function deriveSkeletonPoints(joints) {
-    // Direct mappings from the 23‑joint list
-    const leftToe = joints[0];
-    const rightToe = joints[1];
-    const leftAnkle = joints[4];
-    const rightAnkle = joints[5];
+    // Helper to average multiple joints
+    const avg = (indices) => {
+      const out = { x: 0, y: 0, z: 0 };
+      indices.forEach((idx) => {
+        out.x += joints[idx].x;
+        out.y += joints[idx].y;
+        out.z += joints[idx].z;
+      });
+      const inv = 1 / indices.length;
+      out.x *= inv;
+      out.y *= inv;
+      out.z *= inv;
+      return out;
+    };
+    // Derive 14 key points: leftFoot, leftKnee, leftHip, core, leftShoulder,
+    // leftElbow, leftHand, head, rightHand, rightElbow, rightShoulder,
+    // rightHip, rightKnee, rightFoot. See players.hpp for joint ordering.
+    const leftFoot = avg([0, 2, 4]);
     const leftKnee = joints[6];
-    const rightKnee = joints[7];
     const leftHip = joints[8];
-    const rightHip = joints[9];
+    const core = avg([8, 9, 20]);
     const leftShoulder = joints[10];
-    const rightShoulder = joints[11];
     const leftElbow = joints[12];
-    const rightElbow = joints[13];
-    const leftWrist = joints[14];
-    const rightWrist = joints[15];
+    // left hand at the palm (LeftHand index 16)
     const leftHand = joints[16];
-    const rightHand = joints[17];
-    // We do not use the finger points separately; palms are sufficient
-    const core = joints[20];
     const head = joints[22];
-    return [leftToe, leftAnkle, leftKnee, leftHip, core,
-            leftShoulder, leftElbow, leftWrist, leftHand, head,
-            rightHand, rightWrist, rightElbow, rightShoulder,
-            rightHip, rightKnee, rightAnkle, rightToe];
+    // right hand at the palm (RightHand index 17)
+    const rightHand = joints[17];
+    const rightElbow = joints[13];
+    const rightShoulder = joints[11];
+    const rightHip = joints[9];
+    const rightKnee = joints[7];
+    const rightFoot = avg([1, 3, 5]);
+    return [leftFoot, leftKnee, leftHip, core, leftShoulder, leftElbow,
+            leftHand, head, rightHand, rightElbow, rightShoulder,
+            rightHip, rightKnee, rightFoot];
   }
 
   /**
@@ -747,72 +750,15 @@ class Chain {
       stateEl.textContent = st.name.replace(/\n/g, ' / ');
     }
 
-    // If the state includes precomputed skeletons (from GrappleMap),
-    // convert them into our extended 18‑point representation by
-    // inserting ankle and wrist joints between existing points.  The
-    // original precomputed skeletons contain 14 points in the order
-    // documented in deriveSkeletonPoints() prior to our extension:
-    //   0:leftFoot,1:leftKnee,2:leftHip,3:core,4:leftShoulder,
-    //   5:leftElbow,6:leftHand,7:head,8:rightHand,9:rightElbow,
-    //   10:rightShoulder,11:rightHip,12:rightKnee,13:rightFoot.
-    // We compute leftAnkle midway between leftFoot and leftKnee, leftWrist
-    // midway between leftElbow and leftHand, and similarly for the right
-    // side.  If no precomputed skeleton exists, fall back to deriving
-    // skeletons from the simplified chains.
+    // If the state includes precomputed skeletons (from GrappleMap), use
+    // them directly to render the avatars.  Otherwise fall back to
+    // deriving skeletons from the simplified chains.  States parsed
+    // from GrappleMap include skeleton1/skeleton2 arrays with 14
+    // positions.  Fallback states omit these fields, so update the
+    // skeletons from chains in that case.
     if (st.skeleton1 && st.skeleton2) {
-      function convertSk(sk) {
-        // ensure we have at least 14 points
-        if (!Array.isArray(sk) || sk.length < 14) {
-          return [];
-        }
-        const leftFoot = sk[0];
-        const leftKnee = sk[1];
-        const leftHip = sk[2];
-        const core = sk[3];
-        const leftShoulder = sk[4];
-        const leftElbow = sk[5];
-        const leftHand = sk[6];
-        const head = sk[7];
-        const rightHand = sk[8];
-        const rightElbow = sk[9];
-        const rightShoulder = sk[10];
-        const rightHip = sk[11];
-        const rightKnee = sk[12];
-        const rightFoot = sk[13];
-        // helper to midpoint
-        const mid = (a,b) => {
-          return { x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5, z: (a.z + b.z) * 0.5 };
-        };
-        // Place ankle closer to the foot (70% foot, 30% knee)
-        const leftAnkle = {
-          x: leftFoot.x * 0.7 + leftKnee.x * 0.3,
-          y: leftFoot.y * 0.7 + leftKnee.y * 0.3,
-          z: leftFoot.z * 0.7 + leftKnee.z * 0.3
-        };
-        const rightAnkle = {
-          x: rightFoot.x * 0.7 + rightKnee.x * 0.3,
-          y: rightFoot.y * 0.7 + rightKnee.y * 0.3,
-          z: rightFoot.z * 0.7 + rightKnee.z * 0.3
-        };
-        // Place wrist closer to the hand (70% hand, 30% elbow)
-        const leftWrist = {
-          x: leftElbow.x * 0.3 + leftHand.x * 0.7,
-          y: leftElbow.y * 0.3 + leftHand.y * 0.7,
-          z: leftElbow.z * 0.3 + leftHand.z * 0.7
-        };
-        const rightWrist = {
-          x: rightElbow.x * 0.3 + rightHand.x * 0.7,
-          y: rightElbow.y * 0.3 + rightHand.y * 0.7,
-          z: rightElbow.z * 0.3 + rightHand.z * 0.7
-        };
-        // assemble extended skeleton
-        return [leftFoot, leftAnkle, leftKnee, leftHip, core,
-                leftShoulder, leftElbow, leftWrist, leftHand, head,
-                rightHand, rightWrist, rightElbow, rightShoulder,
-                rightHip, rightKnee, rightAnkle, rightFoot];
-      }
-      currentSkeleton1 = convertSk(st.skeleton1).map((p) => new Vec3(p.x, p.y, p.z));
-      currentSkeleton2 = convertSk(st.skeleton2).map((p) => new Vec3(p.x, p.y, p.z));
+      currentSkeleton1 = st.skeleton1.map((p) => new Vec3(p.x, p.y, p.z));
+      currentSkeleton2 = st.skeleton2.map((p) => new Vec3(p.x, p.y, p.z));
     } else {
       updateSkeletonsFromChains();
     }
@@ -1010,11 +956,83 @@ class Chain {
     const worldDelta = right.clone().multiplyScalar(dx * scale).add(
       up.clone().multiplyScalar(-dy * scale)
     );
-    selPt.add(worldDelta);
-    // Adjust chain to maintain bone lengths
-    selected.chain.adjust(selected.index);
-
-    // Update skeleton representation based on the modified chain positions.
+    // Compute proposed new position for the selected joint
+    let newPos = selPt.clone().add(worldDelta);
+    const chain = selected.chain;
+    const idx = selected.index;
+    // Clamp the new position so the joint does not extend beyond its
+    // neighbouring segments.  This prevents pulling a limb so far that
+    // it drags the entire body.  We ensure the distance to each
+    // adjacent joint does not exceed the corresponding segment length.
+    if (idx > 0) {
+      const prev = chain.joints[idx - 1];
+      const lenPrev = chain.lengths[idx - 1];
+      const dirPrev = newPos.clone().sub(prev);
+      const distPrev = dirPrev.length();
+      if (distPrev > lenPrev && distPrev > 1e-6) {
+        dirPrev.multiplyScalar(lenPrev / distPrev);
+        newPos = prev.clone().add(dirPrev);
+      }
+    }
+    if (idx < chain.joints.length - 1) {
+      const next = chain.joints[idx + 1];
+      const lenNext = chain.lengths[idx];
+      const dirNext = newPos.clone().sub(next);
+      const distNext = dirNext.length();
+      if (distNext > lenNext && distNext > 1e-6) {
+        dirNext.multiplyScalar(lenNext / distNext);
+        newPos = next.clone().add(dirNext);
+      }
+    }
+    // Apply the clamped position to the selected joint
+    selPt.copy(newPos);
+    // For the first chain (user poses), adjust only the limb segment
+    // rather than the entire chain.  Anchor the hip at index 2 so
+    // moving a foot or hand does not pull the whole body.  For the
+    // second chain (controlled via topology coordinates), fall back
+    // to full adjustment.
+    if (chain === chain1) {
+      const rootIdx = 2;
+      if (idx < rootIdx) {
+        for (let i = idx; i < rootIdx; i++) {
+          const a = chain.joints[i];
+          const b = chain.joints[i + 1];
+          const targetLen = chain.lengths[i];
+          const dir = b.clone().sub(a);
+          const len = dir.length();
+          if (len > 0) {
+            dir.multiplyScalar(targetLen / len);
+            b.copy(a.clone().add(dir));
+          }
+        }
+      } else if (idx > rootIdx) {
+        for (let i = idx; i > rootIdx; i--) {
+          const a = chain.joints[i];
+          const b = chain.joints[i - 1];
+          const targetLen = chain.lengths[i - 1];
+          const dir = b.clone().sub(a);
+          const len = dir.length();
+          if (len > 0) {
+            dir.multiplyScalar(targetLen / len);
+            b.copy(a.clone().add(dir));
+          }
+        }
+      } else {
+        chain.adjust(idx);
+      }
+    } else {
+      chain.adjust(idx);
+    }
+    // Update base chain positions so that subsequent topology
+    // transformations originate from the new pose.  We update the
+    // corresponding base chain for whichever chain was modified via
+    // direct manipulation.
+    if (chain === chain1) {
+      baseChain1 = chain1.joints.map((p) => p.clone());
+    } else if (chain === chain2 && !draggingTopology) {
+      baseChain2 = chain2.joints.map((p) => p.clone());
+    }
+    // Refresh the skeletons to reflect the updated joint positions
     updateSkeletonsFromChains();
   }
 
@@ -1030,40 +1048,30 @@ class Chain {
       const dx = p.x - hip.x;
       return new Vec3(hip.x - dx, p.y, p.z);
     }
-    // Compute skeleton for a single chain (fallback mode).
+    // Compute skeleton for a single chain
     function computeSkeletonFromChain(chain) {
       // Each simplified chain has 6 joints: foot, knee, hip, shoulder, hand, head.
-      // We derive an 18‑point skeleton by interpolating extra joints along each
-      // segment and mirroring the left side across the hips for the right side.
-      const footL = chain.joints[0].clone();        // toe
-      const kneeL = chain.joints[1].clone();        // knee
-      const hip = chain.joints[2].clone();          // hip (and core)
-      const core = hip.clone();                     // use hip for core in fallback
-      const shoulderL = chain.joints[3].clone();    // shoulder
-      const handL = chain.joints[4].clone();        // palm
-      const head = chain.joints[5].clone();         // head
+      // We derive a 14‑point skeleton mirroring left‑side joints across the hips and
+      // approximating elbows midway between the shoulder and hand. The hip also
+      // serves as the core for fallback poses.
+      const footL = chain.joints[0].clone();
+      const kneeL = chain.joints[1].clone();
+      const hip = chain.joints[2].clone();
+      const core = hip.clone();
+      const shoulderL = chain.joints[3].clone();
       // approximate elbow halfway between shoulder and hand
       const elbowL = chain.joints[3].clone().multiplyScalar(0.5).add(chain.joints[4].clone().multiplyScalar(0.5));
-      // approximate wrist roughly two‑thirds from elbow to hand
-      const wristL = elbowL.clone().multiplyScalar(0.3).add(handL.clone().multiplyScalar(0.7));
-      // approximate ankle roughly one‑third from foot to knee
-      const ankleL = footL.clone().multiplyScalar(0.7).add(kneeL.clone().multiplyScalar(0.3));
-      // Mirror helper for right side
-      const mirror = (p) => {
-        const dx = p.x - hip.x;
-        return new Vec3(hip.x - dx, p.y, p.z);
-      };
-      // Mirror left side joints to obtain right side
-      const handR = mirror(handL);
-      const wristR = mirror(wristL);
-      const elbowR = mirror(elbowL);
-      const shoulderR = mirror(shoulderL);
-      const hipR = mirror(hip);
-      const kneeR = mirror(kneeL);
-      const ankleR = mirror(ankleL);
-      const footR = mirror(footL);
-      return [footL, ankleL, kneeL, hip, core, shoulderL, elbowL, wristL, handL, head,
-              handR, wristR, elbowR, shoulderR, hipR, kneeR, ankleR, footR];
+      const handL = chain.joints[4].clone();
+      const head = chain.joints[5].clone();
+      // mirror points across the hip for right side
+      const handR = mirrorPoint(handL, hip);
+      const elbowR = mirrorPoint(elbowL, hip);
+      const shoulderR = mirrorPoint(shoulderL, hip);
+      const hipR = mirrorPoint(hip, hip); // identical to hip for fallback
+      const kneeR = mirrorPoint(kneeL, hip);
+      const footR = mirrorPoint(footL, hip);
+      return [footL, kneeL, hip, core, shoulderL, elbowL, handL, head,
+              handR, elbowR, shoulderR, hipR, kneeR, footR];
     }
     currentSkeleton1 = computeSkeletonFromChain(chain1);
     currentSkeleton2 = computeSkeletonFromChain(chain2);
@@ -1119,34 +1127,41 @@ class Chain {
     // convey perspective.
     const drawSkeleton = (skeleton, color) => {
       if (!skeleton || skeleton.length === 0) return;
-      // Define edges connecting the skeleton joints (18‑point layout).
-      // Indices: 0: left toe, 1: left ankle, 2: left knee, 3: left hip,
-      // 4: core, 5: left shoulder, 6: left elbow, 7: left wrist,
-      // 8: left hand, 9: head, 10: right hand, 11: right wrist,
-      // 12: right elbow, 13: right shoulder, 14: right hip, 15: right knee,
-      // 16: right ankle, 17: right toe.
-      // We connect the toes up to the hips, hips to core, arms out from
-      // the shoulders, wrists to hands, and the head connects to both
-      // shoulders.
+      // Define edges connecting the skeleton joints (14‑point layout)
+      // Indices: 0:footL,1:kneeL,2:hipL,3:core,4:shoulderL,5:elbowL,6:handL,
+      // 7:head,8:handR,9:elbowR,10:shoulderR,11:hipR,12:kneeR,13:footR
+      // Define edges connecting the 14‑point skeleton.  The layout is:
+      // 0: left foot
+      // 1: left knee
+      // 2: left hip
+      // 3: core/torso
+      // 4: left shoulder
+      // 5: left elbow
+      // 6: left hand
+      // 7: head/neck
+      // 8: right hand
+      // 9: right elbow
+      // 10: right shoulder
+      // 11: right hip
+      // 12: right knee
+      // 13: right foot
+      // We connect legs up to the core, arms out from the shoulders,
+      // and the head connects to both shoulders to suggest a neck.
       const edges = [
-        [0, 1],   // left toe to left ankle
-        [1, 2],   // left ankle to left knee
-        [2, 3],   // left knee to left hip
-        [3, 4],   // left hip to core
-        [14, 4],  // right hip to core
-        [14, 15], // right hip to right knee
-        [15, 16], // right knee to right ankle
-        [16, 17], // right ankle to right toe
-        [4, 5],   // core to left shoulder
-        [5, 6],   // left shoulder to left elbow
-        [6, 7],   // left elbow to left wrist
-        [7, 8],   // left wrist to left hand
-        [4, 13],  // core to right shoulder
-        [13, 12], // right shoulder to right elbow
-        [12, 11], // right elbow to right wrist
-        [11, 10], // right wrist to right hand
-        [5, 9],   // left shoulder to head
-        [13, 9]   // right shoulder to head
+        [0, 1], // left foot to left knee
+        [1, 2], // left knee to left hip
+        [2, 3], // left hip to core
+        [13, 12], // right foot to right knee (reverse order)
+        [12, 11], // right knee to right hip
+        [11, 3], // right hip to core
+        [3, 4], // core to left shoulder
+        [4, 5], // left shoulder to left elbow
+        [5, 6], // left elbow to left hand
+        [3, 10], // core to right shoulder
+        [10, 9], // right shoulder to right elbow
+        [9, 8], // right elbow to right hand
+        [4, 7], // left shoulder to head/neck
+        [10, 7] // right shoulder to head/neck
       ];
       // Project all points once
       const projections = skeleton.map((pt) => projectPoint(pt, basis));
