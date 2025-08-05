@@ -9,11 +9,27 @@
 <body>
   <div id="overlay">
     <div id="link-label">Linking Number: <span id="link-value">0</span></div>
+    <!-- Display the nearest state computed from topology coordinates. -->
+    <div id="current-state">Nearest State: <span id="nearest-state">-</span></div>
+    <div id="state-container">
+      <label for="state-search" style="display:none">Search:</label>
+      <!-- Text input for filtering the list of available states. The user can type
+           part of a pose name and matching states will be shown in the drop‑down. -->
+      <input id="state-search" type="text" placeholder="Search states…" />
+      <select id="state-select">
+        <option value="">Loading…</option>
+      </select>
+    </div>
     <div id="instructions">
-      Left‑drag joints to move them. Right‑drag to rotate the camera. Scroll to zoom.
+      Left‑drag joints to move them through the latent topological space; a simple
+      solver prevents the avatars from clipping through each other. Use right‑drag to
+      rotate the camera. Scroll to zoom.
     </div>
   </div>
   <canvas id="canvas"></canvas>
+  <!-- Load precomputed grappling poses.  This file defines
+       window.PRECOMPUTED_STATES if available. -->
+  <script src="states.js"></script>
   <script src="script.js"></script>
 </body>
 </html>
