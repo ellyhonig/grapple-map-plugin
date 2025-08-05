@@ -245,6 +245,24 @@ function drawAvatar(av,col,b){
     const r = Math.max(2,10/p.z);
     ctx.beginPath(); ctx.arc(p.x,p.y,r,0,Math.PI*2); ctx.fill();
   });
+    // --- neck endpoint at 80% of core→head ---
+  const core3D = av.j[PARENT[HEAD_IDX]];              // core idx = 3
+  const head3D = av.j[HEAD_IDX];
+  const neckDir = head3D.clone().sub(core3D).norm();
+  const neckLen = av.len[HEAD_IDX] * 0.8;
+  const neckPoint3D = core3D.clone().add(neckDir.mul(neckLen));
+  const neckProj = project(neckPoint3D, b);
+
+  // --- shoulders projection ---
+  const sl = proj[SHOULDER_L_IDX], sr = proj[SHOULDER_R_IDX];
+
+  if (neckProj) {
+    ctx.lineWidth =  Math.max(1, 6 / neckProj.z);
+    ctx.beginPath();
+    if (sl) { ctx.moveTo(sl.x, sl.y); ctx.lineTo(neckProj.x, neckProj.y); }
+    if (sr) { ctx.moveTo(sr.x, sr.y); ctx.lineTo(neckProj.x, neckProj.y); }
+    ctx.stroke();
+  }
 }
 
 function linkNumber(){
